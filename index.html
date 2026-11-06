@@ -213,9 +213,12 @@ th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)
 </nav>
 
 <script>
-// Réglages de l'app pour un restaurant. Pour un autre restaurant du groupe : copier le dossier et changer ces valeurs.
-const RESTAURANT='Monsieur Bleu';
-const SHEET_URL='';
+// Réglages de l'appli. Pour un autre restaurant du groupe, l'ajouter dans RESTAURANTS.
+const RESTAURANT='Monsieur Bleu';            // restaurant par défaut
+const RESTAURANTS=['Monsieur Bleu'];         // liste proposée à la création de compte
+const ADMINS=[];                             // e-mails des administrateurs (voient tout, nomment les managers)
+const FIREBASE=null;                         // coller ici la config web Firebase ({apiKey:..., authDomain:..., projectId:..., appId:...})
+const SHEET_URL='';                          // facultatif : envoi des scores vers un Google Sheet
 
 // Envoi des scores vers le Google Sheet des managers, avec file d'attente hors ligne.
 const DEVICE=(()=>{try{let d=localStorage.getItem('mb-device');if(!d){d=Math.random().toString(36).slice(2,8);localStorage.setItem('mb-device',d)}return d}catch{return '?'}})();
@@ -307,7 +310,7 @@ function game(){const g=store.get('mb-game',{xp:0,days:{},streak:0,last:''});ret
 function streakNow(g){if(!g.last)return 0;const d=(new Date(today())-new Date(g.last))/864e5;return d<=1?g.streak:0}
 function addXP(n){const g=game(),t=today();g.xp+=n;g.days[t]=(g.days[t]||0)+n;
   if(g.last!==t){const d=g.last?(new Date(t)-new Date(g.last))/864e5:99;g.streak=d===1?g.streak+1:1;g.last=t}
-  const keep=Object.keys(g.days).sort().slice(-30);g.days=Object.fromEntries(keep.map(k=>[k,g.days[k]]));store.set('mb-game',g);renderGame();return g}
+  const keep=Object.keys(g.days).sort().slice(-30);g.days=Object.fromEntries(keep.map(k=>[k,g.days[k]]));store.set('mb-game',g);renderGame();if(window.cloudSave)cloudSave();return g}
 function renderGame(){const g=game(),x=g.days[today()]||0,s=streakNow(g);$('#xp').textContent=g.xp;$('#streak').textContent=s;
   $('#goal').innerHTML=`<div class="row" style="justify-content:space-between"><b>Objectif du jour</b><span class="meta" style="flex:0 0 auto">${Math.min(x,GOAL)} / ${GOAL} XP</span></div><div class="progress"><i style="width:${Math.min(100,x/GOAL*100)}%"></i></div>`;
   const n=playerName();$('#hi').textContent=!n?"Salut ! Moi c'est Bouchon. Dis-moi ton prénom et on révise la carte.":x>=GOAL?`Objectif atteint, ${n} ! Tu peux encore t'entraîner.`:s>1?`${n}, ${s} jours d'affilée ! On garde la série ?`:`Salut ${n} ! Un petit quiz pour gagner tes XP du jour ?`}
@@ -361,7 +364,7 @@ const playerName=()=>store.get('mb-name','')||(state&&state.name)||window._name|
 function setName(){const v=$('#name').value.trim();if(!v)return;window._name=v;store.set('mb-name',v);$('#whoNote').textContent=`C'est noté, ${v}.`;$('#who').hidden=true;renderGame();if(db&&uid)pushMine()}
 $('#saveName').onclick=setName;$('#name').addEventListener('keydown',e=>{if(e.key==='Enter')setName()});$('#name').addEventListener('change',setName);
 function localAttempts(){return store.get('mb-attempts',[])}
-function saveAttempt(att){if(typeof sendSheet==='function')sendSheet(att);const l=[att,...localAttempts()].slice(0,50);store.set('mb-attempts',l);window._att=l;if(db&&uid)pushMine()}
+function saveAttempt(att){if(typeof sendSheet==='function')sendSheet(att);const l=[att,...localAttempts()].slice(0,50);store.set('mb-attempts',l);window._att=l;if(window.cloudSave)cloudSave();if(db&&uid)pushMine()}
 function pushMine(){const l=window._att||localAttempts();const name=playerName();
   writing=writing.then(()=>db.doc('results/'+uid).set({name,updated:new Date().toISOString(),attempts:l.slice(0,50)})).catch(()=>{})}
 function renderMine(){const l=window._att||localAttempts();$('#mine').hidden=!l.length;
@@ -453,4 +456,130 @@ renderThemes();renderMine();renderGame();
 })();
 </script>
 
+<script>
+// Connexion par e-mail + mot de passe (Firebase) et sauvegarde de la progression en ligne.
+// Sans FIREBASE dans config.js, l'appli marche comme avant, en local sur le téléphone.
+(function(){
+const ON = typeof FIREBASE==='object' && FIREBASE && FIREBASE.apiKey && typeof firebase!=='undefined';
+window.cloudSave=()=>{};
+if(!ON) return;
+firebase.initializeApp(FIREBASE);
+const auth=firebase.auth(), fs=firebase.firestore();
+if(FIREBASE.emulator){auth.useEmulator('http://localhost:9099',{disableWarnings:true});fs.useEmulator('localhost',8080)} // tests uniquement
+try{fs.enablePersistence({synchronizeTabs:true}).catch(()=>{})}catch{}
+const ADMINS_=(typeof ADMINS!=='undefined'?ADMINS:[]).map(x=>x.toLowerCase());
+const RESTOS=(typeof RESTAURANTS!=='undefined'&&RESTAURANTS.length)?RESTAURANTS:[RESTAURANT];
+let me=null, profile=null, timer=null;
+
+const MSG={'auth/invalid-email':"Cette adresse e-mail n'est pas valide.",'auth/email-already-in-use':'Un compte existe déjà avec cet e-mail. Connecte-toi.',
+ 'auth/weak-password':'Le mot de passe doit faire au moins 6 caractères.','auth/invalid-credential':'E-mail ou mot de passe incorrect.',
+ 'auth/wrong-password':'E-mail ou mot de passe incorrect.','auth/user-not-found':'Aucun compte avec cet e-mail.','auth/missing-password':'Entre ton mot de passe.',
+ 'auth/too-many-requests':'Trop d\'essais. Réessaie dans quelques minutes.','auth/network-request-failed':'Pas de connexion internet.'};
+const err=e=>MSG[e&&e.code]||'Une erreur est survenue. Réessaie.';
+
+// ---------- écran de connexion ----------
+const box=document.createElement('div');box.id='login';box.hidden=true;document.body.appendChild(box);
+let mode='in';
+function drawLogin(note){
+  box.innerHTML=`<div class="lwrap">
+  <svg class="hop" width="120" height="140" aria-hidden="true"><use href="#bouchon"/></svg>
+  <h2 style="font-size:26px;text-align:center">${mode==='in'?'Content de te revoir !':mode==='up'?'Crée ton compte':'Mot de passe oublié'}</h2>
+  <p class="meta" style="text-align:center;margin:0">${mode==='reset'?'Entre ton e-mail, on t\'envoie un lien pour choisir un nouveau mot de passe.':'Révise la carte et garde ta progression sur tous tes appareils.'}</p>
+  <form id="lform" style="display:grid;gap:12px;width:100%">
+    ${mode==='up'?`<input type="text" id="lname" placeholder="Prénom" autocomplete="given-name" required>`:''}
+    <input type="email" id="lmail" placeholder="E-mail" autocomplete="email" inputmode="email" required>
+    ${mode!=='reset'?`<input type="password" id="lpass" placeholder="Mot de passe" autocomplete="${mode==='up'?'new-password':'current-password'}" required minlength="6">`:''}
+    ${mode==='up'&&RESTOS.length>1?`<select id="lresto">${RESTOS.map(r=>`<option>${esc(r)}</option>`).join('')}</select>`:''}
+    <div id="lnote" class="lnote" role="alert">${note||''}</div>
+    <button class="btn" type="submit">${mode==='in'?'Se connecter':mode==='up'?'Créer mon compte':'Envoyer le lien'}</button>
+  </form>
+  ${mode==='in'?`<button class="lnk" data-m="reset">Mot de passe oublié ?</button><button class="btn ghost" data-m="up">Créer un compte</button>`:`<button class="btn ghost" data-m="in">J'ai déjà un compte</button>`}
+  </div>`;
+  box.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>{mode=b.dataset.m;drawLogin()});
+  box.querySelector('#lform').onsubmit=async e=>{e.preventDefault();const btn=e.target.querySelector('button');btn.disabled=true;
+    const mail=$('#lmail').value.trim(),pass=$('#lpass')?.value||'';const note=t=>{$('#lnote').textContent=t;btn.disabled=false};
+    try{
+      if(mode==='reset'){await auth.sendPasswordResetEmail(mail);mode='in';drawLogin('E-mail envoyé. Regarde ta boîte de réception (et les spams).');return}
+      if(mode==='up'){const name=$('#lname').value.trim();if(!name)return note('Entre ton prénom.');
+        profile={name,email:mail,restaurant:$('#lresto')?.value||RESTOS[0],created:new Date().toISOString()};
+        store.set('mb-name',name);
+        const c=await auth.createUserWithEmailAndPassword(mail,pass);
+        await fs.doc('users/'+c.user.uid).set(profile,{merge:true}).catch(()=>{});
+      } else await auth.signInWithEmailAndPassword(mail,pass);
+    }catch(x){if(mode==='up')profile=null;note(err(x))}};
+}
+const css=document.createElement('style');css.textContent=`
+#login{position:fixed;inset:0;z-index:30;background:var(--paper);overflow:auto;padding:calc(24px + env(safe-area-inset-top,0px)) 20px 32px}
+#login .lwrap{max-width:420px;margin:0 auto;display:grid;justify-items:center;gap:14px}
+#login input,#login select{font:inherit;width:100%;padding:14px;border:2px solid var(--line);border-radius:14px;background:var(--paper);color:var(--ink)}
+.lnote{min-height:1.2em;font-size:14px;color:var(--ko-ink);text-align:center}
+.lnk{background:none;border:0;color:var(--mut);text-decoration:underline;font-weight:800;padding:4px}
+#suiviBody{color:var(--ink);font-size:15px;min-width:0}#suiviBody .cards3{grid-template-columns:repeat(3,minmax(0,1fr))}#v-suivi,#v-suivi .panel,.table-wrap{min-width:0;max-width:100%}
+#mebtn{background:var(--soft);border:2px solid var(--line);border-radius:999px;width:34px;height:34px;display:grid;place-items:center;font-weight:900;font-size:15px;padding:0}
+`;document.head.appendChild(css);
+
+// ---------- profil (bouton rond dans l'en-tête) ----------
+const mb=document.createElement('button');mb.id='mebtn';mb.setAttribute('aria-label','Mon compte');mb.hidden=true;
+document.querySelector('header.top').appendChild(mb);
+const acct=document.createElement('div');acct.className='panel';acct.hidden=true;$('#home').prepend(acct);
+mb.onclick=()=>{goHome();const w=acct;w.hidden=false;
+  w.innerHTML=`<span class="eyebrow">Mon compte</span><div><b>${esc(profile?.name||'')}</b></div><div class="meta">${esc(me.email)}<br>${esc(profile?.restaurant||'')}${profile?.role==='manager'?' · Manager':''}</div>
+  <div class="row"><button class="btn ghost" id="mclose">Fermer</button><button class="btn bad" id="mout">Se déconnecter</button></div>`;
+  $('#mclose').onclick=()=>{w.hidden=true};$('#mout').onclick=()=>{if(confirm('Se déconnecter ?'))auth.signOut()};window.scrollTo(0,0)};
+
+// ---------- synchro ----------
+const KEYS=['mb-attempts','mb-game','mb-learn'];
+function snapshot(){return{attempts:store.get('mb-attempts',[]).slice(0,50),game:store.get('mb-game',null),learn:store.get('mb-learn',{}),updated:new Date().toISOString()}}
+window.cloudSave=()=>{if(!me)return;clearTimeout(timer);timer=setTimeout(()=>{
+  const g=store.get('mb-game',{});fs.doc('users/'+me.uid).set({...snapshot(),name:profile?.name||playerName(),xp:g.xp||0,restaurant:profile?.restaurant||RESTOS[0],email:me.email},{merge:true}).catch(()=>{})},800)};
+
+auth.onAuthStateChanged(async u=>{
+  me=u;
+  if(!u){mode='in';acct.hidden=true;box.hidden=false;mb.hidden=true;$('#tabSuivi').hidden=true;drawLogin();return}
+  box.hidden=true;
+  let d={};try{const s=await fs.doc('users/'+u.uid).get();d=s.exists?s.data():{}}catch{}
+  profile={...(profile||{}),...d};
+  if(store.get('mb-uid','')!==u.uid){ // autre personne sur ce téléphone : on repart de son compte
+    KEYS.forEach(k=>{try{localStorage.removeItem(k)}catch{}});store.set('mb-uid',u.uid);window._att=null}
+  const loc=store.get('mb-attempts',[]);
+  if((d.attempts||[]).length>=loc.length&&d.updated){store.set('mb-attempts',d.attempts||[]);if(d.game)store.set('mb-game',d.game);if(d.learn)store.set('mb-learn',d.learn);window._att=d.attempts||[]}
+  else cloudSave();
+  if(profile.name)store.set('mb-name',profile.name);
+  if(profile.restaurant)$('#resto').textContent=profile.restaurant;
+  $('#name').value=profile.name||'';$('#who').hidden=true;
+  mb.hidden=false;mb.textContent=(profile.name||u.email||'?').trim()[0].toUpperCase();
+  goHome();
+  const admin=ADMINS_.includes((u.email||'').toLowerCase());
+  if(admin||profile.role==='manager'){$('#tabSuivi').hidden=false;
+    const q=admin?fs.collection('users'):fs.collection('users').where('restaurant','==',profile.restaurant);
+    q.onSnapshot(s=>{team=s.docs.map(x=>({...x.data(),uid:x.id}));window._admin=admin;renderSuivi()},()=>{$('#suiviBody').textContent="Le suivi n'est pas accessible."})}
+});
+
+// ---------- espace manager ----------
+window.renderSuivi=function(){
+  const body=$('#suiviBody'),det=$('#suiviDetail');
+  const ppl=team.filter(t=>t.uid!==me?.uid||(t.attempts||[]).length);
+  if(!ppl.length){body.innerHTML='<p class="note">Personne n\'a encore créé de compte. Partage le lien de l\'appli à l\'équipe.</p>';return}
+  const wk=Date.now()-7*864e5;
+  const rows=ppl.map(t=>{const a=t.attempts||[];const avg=a.length?Math.round(a.reduce((s,x)=>s+x.pct,0)/a.length):null;
+    const by={};a.forEach(x=>{(by[x.theme]=by[x.theme]||[]).push(x.pct)});
+    const weak=Object.entries(by).map(([k,v])=>[k,v.reduce((s,x)=>s+x,0)/v.length]).sort((x,y)=>x[1]-y[1])[0];
+    return {...t,n:a.length,week:a.filter(x=>new Date(x.date)>wk).length,avg,last:a[0],streak:t.game?streakNow(t.game):0,weak:weak&&weak[1]<80?weak[0]:'—'}})
+    .sort((x,y)=>(y.xp||0)-(x.xp||0));
+  const restos=[...new Set(rows.map(r=>r.restaurant||''))];
+  const actifs=rows.filter(r=>r.week).length, quizW=rows.reduce((s,r)=>s+r.week,0);
+  const moy=rows.filter(r=>r.avg!=null);const avgAll=moy.length?Math.round(moy.reduce((s,r)=>s+r.avg,0)/moy.length):0;
+  body.innerHTML=`<div class="cards3" style="margin-bottom:6px"><div class="c3"><div>Équipe</div><div>${rows.length}</div></div><div class="c3"><div>Actifs 7 j</div><div>${actifs}</div></div><div class="c3 g"><div>Moyenne</div><div>${avgAll} %</div></div></div>
+  <p class="note" style="margin:0 0 6px">${quizW} quiz faits cette semaine. Classement par XP.</p>
+  <div class="table-wrap"><table><thead><tr><th>#</th><th>Prénom</th>${restos.length>1?'<th>Restaurant</th>':''}<th>XP</th><th>🔥</th><th>Moy.</th><th>Dernier quiz</th><th>À travailler</th></tr></thead><tbody>${rows.map((r,i)=>`<tr data-i="${i}" style="cursor:pointer"><td>${i+1}</td><td><b>${esc(r.name||'?')}</b>${r.role==='manager'?' <span class="pill m">Manager</span>':''}</td>${restos.length>1?`<td>${esc(r.restaurant||'')}</td>`:''}<td>${r.xp||0}</td><td>${r.streak}</td><td>${r.avg==null?'—':`<span class="pill ${r.avg>=80?'g':r.avg>=50?'m':'r'}">${r.avg} %</span>`}</td><td>${r.last?new Date(r.last.date).toLocaleDateString('fr-FR'):'—'}</td><td>${esc(r.weak)}</td></tr>`).join('')}</tbody></table></div><p class="note">Touche une ligne pour voir le détail.</p>`;
+  $('#suiviBody tbody').onclick=e=>{const tr=e.target.closest('tr');if(!tr)return;const r=rows[+tr.dataset.i];det.hidden=false;
+    det.innerHTML=`<div class="row" style="justify-content:space-between"><h2>${esc(r.name||'?')}</h2><span class="meta" style="flex:0 0 auto">${esc(r.email||'')}</span></div>
+    <div class="meta">${esc(r.restaurant||'')} · ${r.n} quiz · 💎 ${r.xp||0} XP · 🔥 ${r.streak}</div>
+    ${window._admin&&r.uid!==me.uid?`<button class="btn ghost" id="role">${r.role==='manager'?'Retirer le rôle manager':'Nommer manager'}</button>`:''}
+    ${(r.attempts||[]).slice(0,20).map(a=>`<div class="fiche"><div class="row" style="justify-content:space-between"><span>${esc(a.theme)}</span><span class="meta" style="flex:0 0 auto">${new Date(a.date).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})}</span><span class="pill ${a.pct>=80?'g':a.pct>=50?'m':'r'}" style="flex:0 0 auto">${a.score}/${a.total}</span></div>${(a.errors||[]).map(w=>`<p class="meta">✗ ${esc(w.q)} → <b>${esc(w.a)}</b></p>`).join('')}</div>`).join('')||'<p class="note">Pas encore de quiz.</p>'}`;
+    const rb=$('#role');if(rb)rb.onclick=async()=>{rb.disabled=true;try{await fs.doc('users/'+r.uid).set({role:r.role==='manager'?'':'manager'},{merge:true})}catch{alert('Modification refusée.')}};
+    det.scrollIntoView({behavior:'smooth'})}};
+})();
+
+</script>
 </body></html>

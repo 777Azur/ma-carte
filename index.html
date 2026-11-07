@@ -522,7 +522,7 @@ const css=document.createElement('style');css.textContent=`
 const mb=document.createElement('button');mb.id='mebtn';mb.setAttribute('aria-label','Mon compte');mb.hidden=true;
 document.querySelector('header.top').appendChild(mb);
 const acct=document.createElement('div');acct.className='panel';acct.hidden=true;$('#home').prepend(acct);
-mb.onclick=()=>{goHome();const w=acct;w.hidden=false;
+mb.onclick=()=>{document.querySelector('#tabs [data-v=quiz]').click();goHome();const w=acct;w.hidden=false;
   w.innerHTML=`<span class="eyebrow">Mon compte</span><div><b>${esc(profile?.name||'')}</b></div><div class="meta">${esc(me.email)}<br>${esc(profile?.restaurant||'')}${profile?.role==='manager'?' · Manager':''}</div>
   <div class="row"><button class="btn ghost" id="mclose">Fermer</button><button class="btn bad" id="mout">Se déconnecter</button></div>`;
   $('#mclose').onclick=()=>{w.hidden=true};$('#mout').onclick=()=>{if(confirm('Se déconnecter ?'))auth.signOut()};window.scrollTo(0,0)};
@@ -530,8 +530,11 @@ mb.onclick=()=>{goHome();const w=acct;w.hidden=false;
 // ---------- synchro ----------
 const KEYS=['mb-attempts','mb-game','mb-learn'];
 function snapshot(){return{attempts:store.get('mb-attempts',[]).slice(0,50),game:store.get('mb-game',null),learn:store.get('mb-learn',{}),updated:new Date().toISOString()}}
-window.cloudSave=()=>{if(!me)return;clearTimeout(timer);timer=setTimeout(()=>{
-  const g=store.get('mb-game',{});fs.doc('users/'+me.uid).set({...snapshot(),name:profile?.name||playerName(),xp:g.xp||0,restaurant:profile?.restaurant||RESTOS[0],email:me.email},{merge:true}).catch(()=>{})},800)};
+let pending=null;
+window.cloudSave=()=>{if(!me)return;clearTimeout(timer);pending=()=>{pending=null;
+  const g=store.get('mb-game',{});fs.doc('users/'+me.uid).set({...snapshot(),name:profile?.name||playerName(),xp:g.xp||0,restaurant:profile?.restaurant||RESTOS[0],email:me.email},{merge:true}).catch(()=>{})};timer=setTimeout(()=>pending&&pending(),800)};
+addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&pending){clearTimeout(timer);pending()}});
+addEventListener('pagehide',()=>{if(pending){clearTimeout(timer);pending()}});
 
 auth.onAuthStateChanged(async u=>{
   me=u;
@@ -577,7 +580,7 @@ window.renderSuivi=function(){
     <div class="meta">${esc(r.restaurant||'')} · ${r.n} quiz · 💎 ${r.xp||0} XP · 🔥 ${r.streak}</div>
     ${window._admin&&r.uid!==me.uid?`<button class="btn ghost" id="role">${r.role==='manager'?'Retirer le rôle manager':'Nommer manager'}</button>`:''}
     ${(r.attempts||[]).slice(0,20).map(a=>`<div class="fiche"><div class="row" style="justify-content:space-between"><span>${esc(a.theme)}</span><span class="meta" style="flex:0 0 auto">${new Date(a.date).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})}</span><span class="pill ${a.pct>=80?'g':a.pct>=50?'m':'r'}" style="flex:0 0 auto">${a.score}/${a.total}</span></div>${(a.errors||[]).map(w=>`<p class="meta">✗ ${esc(w.q)} → <b>${esc(w.a)}</b></p>`).join('')}</div>`).join('')||'<p class="note">Pas encore de quiz.</p>'}`;
-    const rb=$('#role');if(rb)rb.onclick=async()=>{rb.disabled=true;try{await fs.doc('users/'+r.uid).set({role:r.role==='manager'?'':'manager'},{merge:true})}catch{alert('Modification refusée.')}};
+    const rb=$('#role');if(rb)rb.onclick=async()=>{rb.disabled=true;try{const nr=r.role==='manager'?'':'manager';await fs.doc('users/'+r.uid).set({role:nr},{merge:true});r.role=nr;rb.textContent=nr?'Retirer le rôle manager':'Nommer manager';rb.disabled=false}catch{rb.disabled=false;alert('Modification refusée.')}};
     det.scrollIntoView({behavior:'smooth'})}};
 })();
 
